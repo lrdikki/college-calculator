@@ -30,6 +30,7 @@ td select{min-width:150px}
 .result{font-size:18px;font-weight:700}
 .accepted{color:#166534}.waitlisted{color:#a16207}.denied{color:#b91c1c}
 .muted{color:#64748b;font-size:14px}
+.margin{font-size:0.75em;color:#64748b;font-weight:400}
 .error{color:#b91c1c;margin-top:12px}.success{color:#166534;margin-top:12px}
 .note{background:#f8fafc;padding:14px;border-radius:8px;margin-top:15px;font-size:14px;line-height:1.5}
 .warning{background:#fff7ed;padding:14px;border-radius:8px;margin-top:15px;font-size:14px;line-height:1.5}
@@ -555,13 +556,13 @@ function renderTable() {
         const r = item.result;
 
         const acceptedText = r
-            ? (r.error ? 'N/A' : `${pct(r.accepted)} ± ${pct(margin(r.seAccepted))}`)
+            ? (r.error ? 'N/A' : `${pct(r.accepted)} <span class="margin">± ${pct(margin(r.seAccepted))}</span>`)
             : '—';
         const waitlistedText = r
-            ? (r.error ? 'N/A' : `${pct(r.waitlisted)} ± ${pct(margin(r.seWaitlisted))}`)
+            ? (r.error ? 'N/A' : `${pct(r.waitlisted)} <span class="margin">± ${pct(margin(r.seWaitlisted))}</span>`)
             : '—';
         const deniedText = r
-            ? (r.error ? 'N/A' : `${pct(r.denied)} ± ${pct(margin(r.seDenied))}`)
+            ? (r.error ? 'N/A' : `${pct(r.denied)} <span class="margin">± ${pct(margin(r.seDenied))}</span>`)
             : '—';
         const historicalText = r
             ? (r.error ? r.error : `${r.total} ${item.plan} applicants`)
@@ -753,7 +754,7 @@ document.getElementById('calculate').addEventListener('click', () => {
         const atLeastOneMargin = margin(noneAcceptedSE);
 
         overallResult.innerHTML =
-            `Odds of at least one acceptance: <span class="accepted">${pct(atLeastOne)} ± ${pct(atLeastOneMargin)}</span>`;
+            `Odds of at least one acceptance: <span class="accepted">${pct(atLeastOne)}</span> <span class="margin">± ${pct(atLeastOneMargin)}</span>`;
 
         let subtext =
             `Based on ${acceptedProbs.length} school${acceptedProbs.length === 1 ? '' : 's'} ` +
