@@ -484,9 +484,9 @@ function makeBinaryTarget(records) {
 // GPA is intentionally fit without a monotonic constraint. This means the
 // historical data are allowed to produce a negative, flat, or positive GPA
 // relationship instead of forcing higher GPA to always predict higher odds.
-function logisticGpaFit(records) {
+function logisticGpaFit(records, field = 'gpa', minimumSlope = -Infinity) {
     const points = records
-        .map(r => ({ x: Number(r.gpa), y: r.outcome === 'accepted' ? 1 : 0 }))
+        .map(r => ({ x: Number(r[field]), y: r.outcome === 'accepted' ? 1 : 0 }))
         .filter(p => Number.isFinite(p.x));
 
     if (!points.length) return { mean: 0, sd: 1, intercept: 0, slope: 0 };
@@ -536,13 +536,36 @@ function logisticGpaFit(records) {
         if (Math.abs(d0) + Math.abs(d1) < 1e-7) break;
     }
 
-    return { mean, sd, intercept, slope };
+    return { mean, sd, intercept, slope: Math.max(minimumSlope, slope) };
 }
 
 function logisticGpaPredict(model, x) {
     if (!model || !Number.isFinite(x)) return 0.5;
     const z = model.intercept + model.slope * ((x - model.mean) / model.sd);
     return sigmoid(z);
+}
+
+// Keep SAT's smoothed isotonic fit within the observed data, but use a
+// non-decreasing logistic trend beyond the first and last observed SAT score.
+// Anchoring the trend at the isotonic endpoint makes this continuous while
+// allowing scores outside a school's historical SAT range to matter.
+function extrapolatingSatPredict(model, x) {
+    if (!model || !model.blocks?.length || !Number.isFinite(x)) return 0.5;
+
+    const blocks = model.blocks;
+    const first = blocks[0];
+    const last = blocks[blocks.length - 1];
+
+    if (x >= first.lo && x <= last.hi) return isotonicPredict(blocks, x);
+
+    const edgeX = x < first.lo ? first.lo : last.hi;
+    const edgeProbability = x < first.lo ? first.value : last.value;
+    const trendAtEdge = logisticGpaPredict(model.tailTrend, edgeX);
+    const trendAtScore = logisticGpaPredict(model.tailTrend, x);
+
+    return sigmoid(
+        logit(edgeProbability) + logit(trendAtScore) - logit(trendAtEdge)
+    );
 }
 
 function fitFeature(records, field) {
@@ -553,12 +576,23 @@ function fitFeature(records, field) {
     const acceptedRate =
         records.filter(r => r.outcome === 'accepted').length / records.length;
 
-    return isotonicFit(
-        makeBinaryTarget(
-            records.map(r => ({ x: r[field], outcome: r.outcome }))
+    return {
+        blocks: isotonicFit(
+            makeBinaryTarget(
+                records.map(r => ({ x: r[field], outcome: r.outcome }))
+            ),
+            acceptedRate
         ),
-        acceptedRate
-    );
+        // SAT is expected to be non-decreasing. Constraining this tail trend
+        // preserves that property even when a small historical sample is noisy.
+        tailTrend: logisticGpaFit(records, 'sat', 0)
+    };
+}
+
+function predictFeature(model, field, x) {
+    return field === 'gpa'
+        ? logisticGpaPredict(model, x)
+        : extrapolatingSatPredict(model, x);
 }
 
 function learnedImportance(records) {
@@ -611,8 +645,8 @@ function learnedImportance(records) {
         let satError = 0;
 
         for (const r of test) {
-            const gp = clamp(logisticGpaPredict(gpaModel, r.gpa), 0.000001, 0.999999);
-            const sp = clamp(isotonicPredict(satModel, r.sat), 0.000001, 0.999999);
+            const gp = clamp(predictFeature(gpaModel, 'gpa', r.gpa), 0.000001, 0.999999);
+            const sp = clamp(predictFeature(satModel, 'sat', r.sat), 0.000001, 0.999999);
 
             const g = logit(gp);
             const s = logit(sp);
@@ -680,8 +714,8 @@ function predict(records, finalModel, sat, gpa, gpaWeight, satWeight) {
 
     const base = clamp(historicalAccepted, 0.03, 0.97);
 
-    const gp = clamp(logisticGpaPredict(finalModel.gpaModel, gpa), 0.000001, 0.999999);
-    const sp = clamp(isotonicPredict(finalModel.satModel, sat), 0.000001, 0.999999);
+    const gp = clamp(predictFeature(finalModel.gpaModel, 'gpa', gpa), 0.000001, 0.999999);
+    const sp = clamp(predictFeature(finalModel.satModel, 'sat', sat), 0.000001, 0.999999);
 
     const b = logit(base);
     const g = logit(gp);
@@ -695,7 +729,12 @@ function predict(records, finalModel, sat, gpa, gpaWeight, satWeight) {
     const nonAccepted = records.filter(r => r.outcome !== 'accepted');
     const waitlisted = nonAccepted.filter(r => r.outcome === 'waitlisted');
 
-    const waitShare = (waitlisted.length + 1) / (nonAccepted.length + 2);
+    // Do not invent a waitlist outcome for schools with no historical
+    // waitlists. When they do exist, divide the non-acceptance probability
+    // according to their observed share of non-accepted outcomes.
+    const waitShare = nonAccepted.length
+        ? waitlisted.length / nonAccepted.length
+        : 0;
 
     const remaining = 1 - accepted;
     const wait = remaining * waitShare;
@@ -727,7 +766,7 @@ function crossValidatedBrier(records, feature) {
         const model = fitFeature(train, feature);
 
         for (const r of test) {
-            const p = clamp(isotonicPredict(model, r[feature]), 0.03, 0.97);
+            const p = clamp(predictFeature(model, feature, r[feature]), 0.03, 0.97);
             const y = r.outcome === 'accepted' ? 1 : 0;
             sum += (p - y) ** 2;
             count++;
