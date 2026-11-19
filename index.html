@@ -283,6 +283,13 @@ No schools selected yet. Choose a school above to add it to the table.
 <div class="card" id="overallCard" style="display:none">
 <h2>Odds of Getting Into At Least One</h2>
 <div class="result" id="overallResult"></div>
+<label class="ci-toggle-row" for="correlationToggle" style="margin-top:8px">
+    <span class="ci-toggle">
+        <input id="correlationToggle" type="checkbox" checked>
+        <span class="ci-slider"></span>
+    </span>
+    <span>Account for correlation between schools</span>
+</label>
 <div class="muted" id="overallSubtext" style="margin-top:6px"></div>
 </div>
 
@@ -316,6 +323,9 @@ function clamp(x, lo, hi) {
 
 const MIN_USABLE_RECORDS = 8;
 const PLAN_ORDER = ['RD', 'EA', 'ED'];
+// Latent correlation between schools after GPA/SAT, estimated from the
+// Naviance data at roughly 0.25-0.30. It captures shared applicant strength.
+const APPLICANT_STRENGTH_RHO = 0.25;
 
 function usableRecordCount(records, plan) {
     return records
@@ -347,6 +357,99 @@ function sigmoid(z) {
 function logit(p) {
     p = clamp(p, 0.000001, 0.999999);
     return Math.log(p / (1 - p));
+}
+
+// Abramowitz-Stegun approximation of the standard normal CDF.
+function normalCdf(x) {
+    if (x === Infinity) return 1;
+    if (x === -Infinity) return 0;
+
+    const absX = Math.abs(x);
+    const t = 1 / (1 + 0.2316419 * absX);
+    const density = 0.3989422804014327 * Math.exp(-0.5 * absX * absX);
+    const tail = density * t * (
+        0.319381530 + t * (-0.356563782 + t * (
+            1.781477937 + t * (-1.821255978 + t * 1.330274429)
+        ))
+    );
+    const cdf = 1 - tail;
+    return x >= 0 ? cdf : 1 - cdf;
+}
+
+// Peter Acklam's rational approximation of the inverse standard normal CDF.
+function inverseNormalCdf(p) {
+    const safeP = clamp(p, 0.000001, 0.999999);
+    const a = [-39.6968302866538, 220.946098424521, -275.928510446969,
+        138.357751867269, -30.6647980661472, 2.50662827745924];
+    const b = [-54.4760987982241, 161.585836858041, -155.698979859887,
+        66.8013118877197, -13.2806815528857];
+    const c = [-0.00778489400243029, -0.322396458041136, -2.40075827716184,
+        -2.54973253934373, 4.37466414146497, 2.93816398269878];
+    const d = [0.00778469570904146, 0.32246712907004, 2.445134137143,
+        3.75440866190742];
+    const low = 0.02425;
+    const high = 1 - low;
+    let q, r;
+
+    if (safeP < low) {
+        q = Math.sqrt(-2 * Math.log(safeP));
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+    }
+    if (safeP > high) {
+        q = Math.sqrt(-2 * Math.log(1 - safeP));
+        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+    }
+
+    q = safeP - 0.5;
+    r = q * q;
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q /
+        (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+}
+
+function independentAtLeastOneProbability(probs) {
+    return 1 - probs.reduce((product, p) => product * (1 - p), 1);
+}
+
+// Deterministic one-factor latent-threshold model. The fixed normal grid is
+// normalized so this uses no sampling or random numbers.
+function atLeastOneProbability(probs, rho = APPLICANT_STRENGTH_RHO) {
+    const safeProbs = probs
+        .map(p => clamp(Number(p), 0, 1))
+        .filter(Number.isFinite);
+
+    if (!safeProbs.length) return 0;
+    if (safeProbs.length === 1) return safeProbs[0];
+    if (safeProbs.some(p => p >= 1)) return 1;
+
+    const nonzeroProbs = safeProbs.filter(p => p > 0);
+    if (!nonzeroProbs.length) return 0;
+
+    const safeRho = clamp(rho, 0, 0.999999);
+    if (safeRho === 0) return independentAtLeastOneProbability(nonzeroProbs);
+
+    const thresholds = nonzeroProbs.map(p => inverseNormalCdf(p));
+    const sharedScale = Math.sqrt(safeRho);
+    const individualScale = Math.sqrt(1 - safeRho);
+    let weightedNoneAccepted = 0;
+    let totalWeight = 0;
+
+    for (let step = -60; step <= 60; step++) {
+        const z = step / 10;
+        const weight = Math.exp(-0.5 * z * z);
+        const conditionalNoneAccepted = thresholds.reduce((product, threshold) => {
+            const conditionalAccepted = normalCdf(
+                (threshold - sharedScale * z) / individualScale
+            );
+            return product * (1 - conditionalAccepted);
+        }, 1);
+
+        weightedNoneAccepted += weight * conditionalNoneAccepted;
+        totalWeight += weight;
+    }
+
+    return clamp(1 - weightedNoneAccepted / totalWeight, 0, 1);
 }
 
 // SAT is fit with monotonic isotonic regression, but each SAT block is
@@ -1196,10 +1299,14 @@ const error = document.getElementById('error');
     const overallCard = document.getElementById('overallCard');
     const overallResult = document.getElementById('overallResult');
     const overallSubtext = document.getElementById('overallSubtext');
+    const accountForCorrelation = document.getElementById('correlationToggle').checked;
 
     if (acceptedProbs.length) {
         const noneAccepted = acceptedProbs.reduce((prod, p) => prod * (1 - p), 1);
-        const atLeastOne = 1 - noneAccepted;
+        const independentAtLeastOne = 1 - noneAccepted;
+        const atLeastOne = accountForCorrelation
+            ? atLeastOneProbability(acceptedProbs, APPLICANT_STRENGTH_RHO)
+            : independentAtLeastOne;
 
         // Propagate per-school uncertainty onto the combined estimate using
         // the delta method on the log scale: Var(ln(1-p)) ≈ (se / (1-p))^2,
@@ -1209,16 +1316,33 @@ const error = document.getElementById('error');
             return sum + Math.pow(acceptedSEs[i] / denom, 2);
         }, 0);
         const noneAcceptedSE = noneAccepted * Math.sqrt(logVarSum);
-        const atLeastOneMargin = margin(noneAcceptedSE);
+        const independentMargin = margin(noneAcceptedSE);
+
+        // Move every school estimate together to reflect fully correlated
+        // estimation error, then retain whichever margin is more conservative.
+        const lowerProbs = acceptedProbs.map((p, i) =>
+            clamp(p - margin(acceptedSEs[i]), 0.0001, 0.9999)
+        );
+        const upperProbs = acceptedProbs.map((p, i) =>
+            clamp(p + margin(acceptedSEs[i]), 0.0001, 0.9999)
+        );
+        const uncertaintyRho = accountForCorrelation ? APPLICANT_STRENGTH_RHO : 0;
+        const correlatedMargin = (
+            atLeastOneProbability(upperProbs, uncertaintyRho) -
+            atLeastOneProbability(lowerProbs, uncertaintyRho)
+        ) / 2;
+        const atLeastOneMargin = Math.max(independentMargin, correlatedMargin);
 
         overallResult.innerHTML =
             `Odds of at least one acceptance: <span class="accepted">${pct(atLeastOne)}</span> <span class="margin confidence-interval">± ${pct(atLeastOneMargin)}</span>`;
 
         let subtext =
             `Based on ${acceptedProbs.length} school${acceptedProbs.length === 1 ? '' : 's'} ` +
-            `with a usable estimate, assuming each school's admissions decision is independent ` +
-            `of the others. In reality, admissions outcomes across schools tend to be at least ` +
-            `somewhat correlated (a stronger or weaker applicant profile affects all of them), ` +
+            `with a usable estimate. ${accountForCorrelation
+                ? 'The result accounts for correlated outcomes.'
+                : 'The result is using independent school outcomes because correlation adjustment is turned off.'} ` +
+            `Admissions outcomes tend to move together because an applicant who is stronger or weaker ` +
+            `than their GPA and SAT suggest tends to be so at all schools, ` +
             `so this is a rough estimate rather than an exact probability. The ± value is an ` +
             `approximate 95% margin of error, driven mainly by each school's historical sample size.`;
 
@@ -1262,6 +1386,12 @@ const error = document.getElementById('error');
 
     trackAnalyticsEvent('calculation_completed');
 }
+
+document.getElementById('correlationToggle').addEventListener('change', () => {
+    if (document.getElementById('overallCard').style.display !== 'none') {
+        calculateAllOdds();
+    }
+});
 
 populateSchoolMenu();
 renderTable();
